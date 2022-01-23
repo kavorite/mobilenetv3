@@ -1,9 +1,20 @@
 from functools import partial
+from re import I
 
-import haiku
+import haiku as hk
 import jax
 import jax.numpy as jnp
-import numpy as np
+
+from . import nf
+
+BatchNorm = partial(hk.BatchNorm, decay_rate=0.9, create_offset=True, create_scale=True)
+
+
+def _depth(x0, d=8):
+    x = max(d, int(x0 + d / 2) // d * d)
+    if x < 0.9 * x0:
+        x += d
+    return x
 
 
 def re(x):
@@ -50,67 +61,66 @@ SMALL_STEM = [
 ]
 
 
-class SqueezeExcite(haiku.Module):
-    def __init__(self, reduction=4):
+class SqueezeExcite(hk.Module):
+    def __init__(self, ratio):
         super().__init__()
-        self.reduction = reduction
+        self.ratio = ratio
 
-    def __call__(self, x):
-        d = x.shape[-1]
-        channels = x.mean(axis=(-3, -2), keepdims=True)
-        squeezed = haiku.Linear(d // self.reduction)(channels)
-        attended = haiku.Linear(d)(squeezed)
-        attn_nrm = jax.nn.relu6(attended + 3) / 6
-        return x * attn_nrm
+    def __call__(self, x0):
+        x = x0.mean(axis=(-3, -2), keepdims=True)
+        x = hk.Linear(_depth(x0.shape[-1] * self.ratio))(x)
+        x = jax.nn.relu(x)
+        x = hk.Linear(x0.shape[-1])(x)
+        x = jax.nn.hard_sigmoid(x)
+        return x0 * x
 
 
-class InvertedResidual(haiku.Module):
+class InvertedResidual(hk.Module):
     def __init__(
-        self,
-        ch_out,
-        kernel,
-        stride,
-        expand,
-        nl=None,
-        use_se=False,
-        normalizer=haiku.BatchNorm,
+        self, ch_out, kernel, stride, expand, nl=None, se_ratio=0.25, norm=BatchNorm
     ):
         super().__init__()
         self.ch_out = ch_out
-        self.use_se = use_se
         self.kernel = kernel
         self.stride = stride
         self.expand = expand
         self.activation = nl
-        self.normalizer = normalizer
+        self.se_ratio = se_ratio
+        self.normalizer = norm
+        self.conv2d = hk.Conv2D if self.normalizer else nf.WSConv2D
 
-    @haiku.transparent
-    def normalize(self, x):
-        return x if self.normalizer is None else self.normalizer(x)
+    @hk.transparent
+    def normalize(self, x, is_training):
+        return x if self.normalizer is None else self.normalizer()(x, is_training)
 
-    @haiku.transparent
-    def activate(self, x):
+    @hk.transparent
+    def activate(self, x, is_training):
         return x if self.activation is None else self.activation(x)
 
-    @haiku.transparent
-    def squeeze_ex(self, x):
-        return SqueezeExcite()(x) if self.use_se else x
+    @hk.transparent
+    def squeeze_ex(self, x0, is_training):
+        if self.se_ratio:
+            x = hk.Conv2D(_depth(x0.shape[-1] * self.expand), 1)(x0)
+            x = SqueezeExcite(self.se_ratio)(x0)
+            x = hk.Conv2D(x0.shape[-1], 1)(x)
+            return x
+        else:
+            return x0
 
-    @haiku.transparent
-    def depth_conv(self, x):
-        return haiku.Conv2D(
-            x.shape[-1],
+    @hk.transparent
+    def depth_conv(self, x, is_training):
+        return hk.DepthwiseConv2D(
+            self.expand,
             kernel_shape=self.kernel,
             stride=self.stride,
             with_bias=False,
-            feature_group_count=self.expand,
         )(x)
 
-    @haiku.transparent
-    def point_conv(self, x, d=None):
-        haiku.Conv2D(d or self.expand, kernel_shape=1, stride=1, with_bias=False)(x)
+    @hk.transparent
+    def point_conv(self, x, is_training):
+        self.conv2d(self.expand, kernel_shape=1, stride=1, with_bias=False)(x)
 
-    def __call__(self, x):
+    def __call__(self, x, is_training):
         for layer in [
             self.point_conv,
             self.normalize,
@@ -122,21 +132,21 @@ class InvertedResidual(haiku.Module):
             self.point_conv,
             self.normalize,
         ]:
-            ftmaps = layer(x)
+            ftmaps = layer(x, is_training)
         if self.stride == 1 and x.shape[-1] == self.ch_out:
             return x + ftmaps
         else:
             return ftmaps
 
 
-class MobileNetV3(haiku.Module):
-    @haiku.transparent
+class MobileNetV3(hk.Module):
+    @hk.transparent
     def preprocess(self, x):
         x = x / 127.5
         x = x - 1.0
         return x
 
-    @haiku.transparent
+    @hk.transparent
     def avgpool(self, x, keepdims):
         sp_mean = partial(jnp.mean, axis=(-3, -2), keepdims=keepdims)
         ops = (sp_mean,)
@@ -144,29 +154,34 @@ class MobileNetV3(haiku.Module):
             x = op(x)
         return x
 
-    def __init__(self, large=True, normalizer=haiku.BatchNorm, alpha=1.0):
+    def __init__(self, large=True, alpha=1.0, se_ratio=0.25, norm=BatchNorm):
         super().__init__()
 
-        def make_divisible(n, d=8):
-            return int(np.ceil(n * 1.0 / d) * d)
-
-        self.blocks = [self.preprocess, haiku.Conv2D(16, 3, with_bias=False), hs]
+        self.blocks = [
+            self.preprocess,
+            hk.Conv2D(_depth(16 * alpha), 3, with_bias=False),
+            hs,
+        ]
 
         stem = LARGE_STEM if large else SMALL_STEM
         for k, exp, ch, se, nl, s in stem:
-            ch_out = make_divisible(ch * alpha)
-            expand = make_divisible(exp * alpha)
-            self.blocks.append(
-                InvertedResidual(ch_out, k, s, expand, nl, se, normalizer)
-            )
+            ch_out = _depth(ch * alpha)
+            expand = _depth(exp * alpha)
+            if se:
+                se = se_ratio
+            self.blocks.append(InvertedResidual(ch_out, k, s, expand, nl, se, norm))
         self.blocks += [
-            haiku.AvgPool(window_shape=7),
-            haiku.Conv2D(make_divisible((1280 if large else 1024) * alpha), 1),
+            hk.AvgPool(window_shape=7, strides=1, padding="SAME"),
+            hk.Conv2D(_depth((1280 if large else 1024) * alpha), 1),
             hs,
-            SqueezeExcite(),
         ]
+        if se_ratio:
+            self.blocks.append(SqueezeExcite(se_ratio))
 
-    def __call__(self, x):
+    def __call__(self, x, is_training=True):
         for block in self.blocks:
-            x = block(x)
+            if isinstance(block, InvertedResidual):
+                x = block(x, is_training)
+            else:
+                x = block(x)
         return x
