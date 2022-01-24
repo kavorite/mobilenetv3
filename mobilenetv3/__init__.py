@@ -98,14 +98,10 @@ class InvertedResidual(hk.Module):
         return x if self.activation is None else self.activation(x)
 
     @hk.transparent
-    def squeeze_ex(self, x0, is_training):
+    def squeeze_ex(self, x, is_training):
         if self.se_ratio:
-            x = hk.Conv2D(_depth(x0.shape[-1] * self.expand), 1)(x0)
-            x = SqueezeExcite(self.se_ratio)(x0)
-            x = hk.Conv2D(x0.shape[-1], 1)(x)
-            return x
-        else:
-            return x0
+            x = SqueezeExcite(self.se_ratio)(x)
+        return x
 
     @hk.transparent
     def depth_conv(self, x, is_training):
@@ -156,12 +152,14 @@ class MobileNetV3(hk.Module):
 
     def __init__(self, large=True, alpha=1.0, se_ratio=0.25, norm=BatchNorm):
         super().__init__()
-
+        stem_conv = hk.Conv2D if norm else nf.WSConv2D
         self.blocks = [
             self.preprocess,
-            hk.Conv2D(_depth(16 * alpha), 3, with_bias=False),
-            hs,
+            stem_conv(_depth(16 * alpha), 3, with_bias=False),
         ]
+        if norm:
+            self.blocks.append(norm())
+        self.blocks.append(hs)
 
         stem = LARGE_STEM if large else SMALL_STEM
         for k, exp, ch, se, nl, s in stem:
