@@ -114,12 +114,12 @@ class InvertedResidual(hk.Module):
         )(x)
 
     @hk.transparent
-    def point_conv(self, x):
-        return self.conv2d(self.expand, kernel_shape=1, stride=1, with_bias=False)(x)
+    def point_conv(self, x, d):
+        return self.conv2d(d, kernel_shape=1, stride=1, with_bias=False)(x)
 
     def __call__(self, x0, is_training):
         if x0.shape[-1] != self.expand:
-            x = self.point_conv(x0)
+            x = self.point_conv(x0, self.expand)
             x = self.normalize(x, is_training)
             x = self.activate(x)
         else:
@@ -128,10 +128,10 @@ class InvertedResidual(hk.Module):
         x = self.normalize(x, is_training)
         x = self.activate(x)
         x = self.squeeze_ex(x)
-        x = self.point_conv(x)
-        x = self.squeeze_ex(x)
+        x = self.point_conv(x, self.ch_out)
+        x = self.normalize(x, is_training)
 
-        if self.stride == 1 and x.shape[-1] == self.ch_out:
+        if self.stride == 1 and x0.shape[-1] == self.ch_out:
             return x + x0
         else:
             return x
@@ -178,10 +178,13 @@ class MobileNetV3(hk.Module):
         if se_ratio:
             self.blocks.append(SqueezeExcite(se_ratio))
 
-    def __call__(self, x, is_training=True):
+    def __call__(self, images, is_training=True, flatten=True):
+        leading_dims = images.shape[:-3]
+        logits = images
         for block in self.blocks:
             if isinstance(block, InvertedResidual):
-                x = block(x, is_training)
+                logits = block(logits, is_training)
             else:
-                x = block(x)
-        return x
+                logits = block(logits)
+        if flatten:
+            return logits.reshape(*leading_dims, -1)
