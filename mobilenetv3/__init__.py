@@ -87,52 +87,54 @@ class InvertedResidual(hk.Module):
         self.activation = nl
         self.se_ratio = se_ratio
         self.normalizer = norm
-        self.conv2d = hk.Conv2D if self.normalizer else nf.WSConv2D
+        self.conv2d = hk.Conv2D if self.normalizer else nf.Conv2D
 
     @hk.transparent
     def normalize(self, x, is_training):
         return x if self.normalizer is None else self.normalizer()(x, is_training)
 
     @hk.transparent
-    def activate(self, x, is_training):
+    def activate(self, x):
         return x if self.activation is None else self.activation(x)
 
     @hk.transparent
-    def squeeze_ex(self, x, is_training):
+    def squeeze_ex(self, x):
         if self.se_ratio:
             x = SqueezeExcite(self.se_ratio)(x)
         return x
 
     @hk.transparent
-    def depth_conv(self, x, is_training):
-        return hk.DepthwiseConv2D(
+    def depth_conv(self, x):
+        return self.conv2d(
             self.expand,
-            kernel_shape=self.kernel,
-            stride=self.stride,
+            self.kernel,
+            self.stride,
             with_bias=False,
+            feature_group_count=self.expand,
         )(x)
 
     @hk.transparent
-    def point_conv(self, x, is_training):
-        self.conv2d(self.expand, kernel_shape=1, stride=1, with_bias=False)(x)
+    def point_conv(self, x):
+        return self.conv2d(self.expand, kernel_shape=1, stride=1, with_bias=False)(x)
 
-    def __call__(self, x, is_training):
-        for layer in [
-            self.point_conv,
-            self.normalize,
-            self.activate,
-            self.depth_conv,
-            self.normalize,
-            self.activate,
-            self.squeeze_ex,
-            self.point_conv,
-            self.normalize,
-        ]:
-            ftmaps = layer(x, is_training)
-        if self.stride == 1 and x.shape[-1] == self.ch_out:
-            return x + ftmaps
+    def __call__(self, x0, is_training):
+        if x0.shape[-1] != self.expand:
+            x = self.point_conv(x0)
+            x = self.normalize(x, is_training)
+            x = self.activate(x)
         else:
-            return ftmaps
+            x = x0
+        x = self.depth_conv(x)
+        x = self.normalize(x, is_training)
+        x = self.activate(x)
+        x = self.squeeze_ex(x)
+        x = self.point_conv(x)
+        x = self.squeeze_ex(x)
+
+        if self.stride == 1 and x.shape[-1] == self.ch_out:
+            return x + x0
+        else:
+            return x
 
 
 class MobileNetV3(hk.Module):
@@ -152,10 +154,10 @@ class MobileNetV3(hk.Module):
 
     def __init__(self, large=True, alpha=1.0, se_ratio=0.25, norm=BatchNorm):
         super().__init__()
-        stem_conv = hk.Conv2D if norm else nf.WSConv2D
+        stem_conv = hk.Conv2D if norm else nf.Conv2D
         self.blocks = [
             self.preprocess,
-            stem_conv(_depth(16 * alpha), 3, with_bias=False),
+            stem_conv(_depth(16 * alpha), 3, stride=2, with_bias=False),
         ]
         if norm:
             self.blocks.append(norm())
@@ -169,7 +171,7 @@ class MobileNetV3(hk.Module):
                 se = se_ratio
             self.blocks.append(InvertedResidual(ch_out, k, s, expand, nl, se, norm))
         self.blocks += [
-            hk.AvgPool(window_shape=7, strides=1, padding="SAME"),
+            hk.AvgPool(window_shape=7, strides=7, padding="SAME"),
             hk.Conv2D(_depth((1280 if large else 1024) * alpha), 1),
             hs,
         ]
